@@ -337,8 +337,55 @@ jobs:
             const depId = process.env.DEP_ID;
 
             if (!accessKeyId || !secretAccessKey) {
-              console.log("No direct R2 S3 credentials found in secrets, skipping S3 SDK upload");
-              process.exit(0);
+              console.log("Using direct HTTPS edge stream upload to R2 via /api/builds/upload-file...");
+              const callbackUrl = process.env.CALLBACK_URL;
+              const callbackBase = new URL(callbackUrl).origin;
+              const secret = process.env.CALLBACK_SECRET || "dev-build-callback-secret";
+              const crypto = require("crypto");
+
+              async function uploadFileViaEdge(fullPath, rel) {
+                const body = fs.readFileSync(fullPath);
+                const timestamp = Date.now().toString();
+                const dataToSign = `${timestamp}.${depId}.${rel}`;
+                const hmac = crypto.createHmac("sha256", secret).update(dataToSign).digest("hex");
+                const uploadUrl = `${callbackBase}/api/builds/upload-file/${depId}/${rel}`;
+                const contentType = rel.endsWith(".html") ? "text/html; charset=utf-8" :
+                                    rel.endsWith(".css") ? "text/css; charset=utf-8" :
+                                    rel.endsWith(".js") ? "application/javascript; charset=utf-8" : "application/octet-stream";
+
+                const res = await fetch(uploadUrl, {
+                  method: "PUT",
+                  headers: {
+                    "Content-Type": contentType,
+                    "x-conversora-signature-256": hmac,
+                    "x-conversora-timestamp": timestamp
+                  },
+                  body
+                });
+                if (!res.ok) {
+                  const errText = await res.text();
+                  throw new Error(`Upload failed for ${rel}: ${res.status} ${errText}`);
+                }
+              }
+
+              async function uploadDirViaEdge(dir, prefix = "") {
+                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                for (const entry of entries) {
+                  const fullPath = path.join(dir, entry.name);
+                  const rel = path.join(prefix, entry.name).replace(/\\/g, "/");
+                  if (entry.isDirectory()) {
+                    await uploadDirViaEdge(fullPath, rel);
+                  } else {
+                    await uploadFileViaEdge(fullPath, rel);
+                  }
+                }
+              }
+
+              uploadDirViaEdge("built-files").then(() => console.log("Edge R2 upload complete")).catch(err => {
+                console.error("Edge R2 upload error:", err);
+                process.exit(1);
+              });
+              return;
             }
 
             const s3 = new S3Client({
@@ -376,6 +423,8 @@ jobs:
           '
         env:
           DEP_ID: ${{ inputs.deployment_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
