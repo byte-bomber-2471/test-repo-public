@@ -430,7 +430,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
-      - name: Notify Conversora API Callback (Signal 1: Fast Path)
+      - name: "Notify Conversora API Callback (Signal 1: Fast Path)"
         if: ${{ needs.build.result == 'success' }}
         run: |
           node -e '
