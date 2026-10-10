@@ -342,24 +342,39 @@ jobs:
               const timestamp = Date.now().toString();
               const dataToSign = `${timestamp}.${depId}.${rel}`;
               const hmac = crypto.createHmac("sha256", secret).update(dataToSign).digest("hex");
-              const uploadUrl = `${callbackBase}/api/builds/upload-file/${depId}/${rel}`;
               const contentType = rel.endsWith(".html") ? "text/html; charset=utf-8" :
                                   rel.endsWith(".css") ? "text/css; charset=utf-8" :
                                   rel.endsWith(".js") ? "application/javascript; charset=utf-8" : "application/octet-stream";
 
-              const res = await fetch(uploadUrl, {
-                method: "PUT",
-                headers: {
-                  "Content-Type": contentType,
-                  "x-conversora-signature-256": hmac,
-                  "x-conversora-timestamp": timestamp
-                },
-                body
-              });
-              if (!res.ok) {
-                const errText = await res.text();
-                throw new Error(`Upload failed for ${rel}: ${res.status} ${errText}`);
+              const endpoints = [
+                `${callbackBase}/api/builds/upload-file/${depId}/${rel}`,
+                `https://demo-web-builder.conversora-tech.workers.dev/api/builds/upload-file/${depId}/${rel}`
+              ];
+
+              let lastErr = null;
+              for (const uploadUrl of endpoints) {
+                try {
+                  const res = await fetch(uploadUrl, {
+                    method: "PUT",
+                    headers: {
+                      "Content-Type": contentType,
+                      "x-conversora-signature-256": hmac,
+                      "x-conversora-timestamp": timestamp
+                    },
+                    body
+                  });
+
+                  if (res.ok) {
+                    return;
+                  }
+
+                  const errText = await res.text();
+                  lastErr = new Error(`Upload failed for ${rel} (${res.status}): ${errText.substring(0, 100)}`);
+                } catch (e) {
+                  lastErr = e;
+                }
               }
+              throw lastErr;
             }
 
             async function uploadDirViaEdge(dir, prefix = "") {
@@ -458,19 +473,35 @@ jobs:
             const timestamp = Date.now().toString();
             const hmac = crypto.createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");
 
-            fetch(callbackUrl, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "x-conversora-signature-256": hmac,
-                "x-conversora-timestamp": timestamp
-              },
-              body: payload
-            }).then(r => r.json()).then(res => {
-              console.log("Callback acknowledgment:", res);
-              if (res.error) process.exit(1);
-            }).catch(err => {
-              console.error("Callback failed:", err);
+            (async () => {
+              const callbackEndpoints = [
+                callbackUrl,
+                "https://demo-web-builder.conversora-tech.workers.dev/api/builds/complete"
+              ];
+
+              for (const endpoint of callbackEndpoints) {
+                try {
+                  const res = await fetch(endpoint, {
+                    method: "POST",
+                    headers: {
+                      "Content-Type": "application/json",
+                      "x-conversora-signature-256": hmac,
+                      "x-conversora-timestamp": timestamp
+                    },
+                    body: payload
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    console.log("Callback acknowledgment from " + endpoint + ":", data);
+                    if (!data.error) return;
+                  }
+                } catch (e) {
+                  console.warn("Callback attempt to " + endpoint + " failed:", e.message);
+                }
+              }
+              process.exit(1);
+            })().catch(err => {
+              console.error("Callback fatal error:", err);
               process.exit(1);
             });
           '
