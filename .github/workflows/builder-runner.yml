@@ -326,95 +326,99 @@ jobs:
           node -e '
             const fs = require("fs");
             const path = require("path");
-            const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+            const crypto = require("crypto");
 
             const accountId = process.env.R2_ACCOUNT_ID;
             const accessKeyId = process.env.R2_ACCESS_KEY_ID;
             const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
             const bucketName = process.env.R2_BUCKET_NAME || "demo-web-builder-sites";
             const depId = process.env.DEP_ID;
+            const callbackUrl = process.env.CALLBACK_URL;
+            const callbackBase = new URL(callbackUrl).origin;
+            const secret = process.env.CALLBACK_SECRET || "dev-build-callback-secret";
 
-            if (!accessKeyId || !secretAccessKey) {
-              console.log("Using direct HTTPS edge stream upload to R2 via /api/builds/upload-file...");
-              const callbackUrl = process.env.CALLBACK_URL;
-              const callbackBase = new URL(callbackUrl).origin;
-              const secret = process.env.CALLBACK_SECRET || "dev-build-callback-secret";
-              const crypto = require("crypto");
+            async function uploadFileViaEdge(fullPath, rel) {
+              const body = fs.readFileSync(fullPath);
+              const timestamp = Date.now().toString();
+              const dataToSign = `${timestamp}.${depId}.${rel}`;
+              const hmac = crypto.createHmac("sha256", secret).update(dataToSign).digest("hex");
+              const uploadUrl = `${callbackBase}/api/builds/upload-file/${depId}/${rel}`;
+              const contentType = rel.endsWith(".html") ? "text/html; charset=utf-8" :
+                                  rel.endsWith(".css") ? "text/css; charset=utf-8" :
+                                  rel.endsWith(".js") ? "application/javascript; charset=utf-8" : "application/octet-stream";
 
-              async function uploadFileViaEdge(fullPath, rel) {
-                const body = fs.readFileSync(fullPath);
-                const timestamp = Date.now().toString();
-                const dataToSign = `${timestamp}.${depId}.${rel}`;
-                const hmac = crypto.createHmac("sha256", secret).update(dataToSign).digest("hex");
-                const uploadUrl = `${callbackBase}/api/builds/upload-file/${depId}/${rel}`;
-                const contentType = rel.endsWith(".html") ? "text/html; charset=utf-8" :
-                                    rel.endsWith(".css") ? "text/css; charset=utf-8" :
-                                    rel.endsWith(".js") ? "application/javascript; charset=utf-8" : "application/octet-stream";
-
-                const res = await fetch(uploadUrl, {
-                  method: "PUT",
-                  headers: {
-                    "Content-Type": contentType,
-                    "x-conversora-signature-256": hmac,
-                    "x-conversora-timestamp": timestamp
-                  },
-                  body
-                });
-                if (!res.ok) {
-                  const errText = await res.text();
-                  throw new Error(`Upload failed for ${rel}: ${res.status} ${errText}`);
-                }
-              }
-
-              async function uploadDirViaEdge(dir, prefix = "") {
-                const entries = fs.readdirSync(dir, { withFileTypes: true });
-                for (const entry of entries) {
-                  const fullPath = path.join(dir, entry.name);
-                  const rel = path.join(prefix, entry.name).replace(/\\/g, "/");
-                  if (entry.isDirectory()) {
-                    await uploadDirViaEdge(fullPath, rel);
-                  } else {
-                    await uploadFileViaEdge(fullPath, rel);
-                  }
-                }
-              }
-
-              uploadDirViaEdge("built-files").then(() => console.log("Edge R2 upload complete")).catch(err => {
-                console.error("Edge R2 upload error:", err);
-                process.exit(1);
+              const res = await fetch(uploadUrl, {
+                method: "PUT",
+                headers: {
+                  "Content-Type": contentType,
+                  "x-conversora-signature-256": hmac,
+                  "x-conversora-timestamp": timestamp
+                },
+                body
               });
-              return;
+              if (!res.ok) {
+                const errText = await res.text();
+                throw new Error(`Upload failed for ${rel}: ${res.status} ${errText}`);
+              }
             }
 
-            const s3 = new S3Client({
-              region: "auto",
-              endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
-              credentials: { accessKeyId, secretAccessKey }
-            });
-
-            async function uploadDir(dir, prefix = "") {
+            async function uploadDirViaEdge(dir, prefix = "") {
               const entries = fs.readdirSync(dir, { withFileTypes: true });
               for (const entry of entries) {
                 const fullPath = path.join(dir, entry.name);
                 const rel = path.join(prefix, entry.name).replace(/\\/g, "/");
                 if (entry.isDirectory()) {
-                  await uploadDir(fullPath, rel);
+                  await uploadDirViaEdge(fullPath, rel);
                 } else {
-                  const body = fs.readFileSync(fullPath);
-                  const key = `builds/${depId}/${rel}`;
-                  await s3.send(new PutObjectCommand({
-                    Bucket: bucketName,
-                    Key: key,
-                    Body: body,
-                    ContentType: rel.endsWith(".html") ? "text/html; charset=utf-8" :
-                                 rel.endsWith(".css") ? "text/css; charset=utf-8" :
-                                 rel.endsWith(".js") ? "application/javascript; charset=utf-8" : "application/octet-stream"
-                  }));
+                  await uploadFileViaEdge(fullPath, rel);
                 }
               }
             }
 
-            uploadDir("built-files").then(() => console.log("R2 upload complete")).catch(err => {
+            (async () => {
+              if (accessKeyId && secretAccessKey) {
+                try {
+                  const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+                  const s3 = new S3Client({
+                    region: "auto",
+                    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+                    credentials: { accessKeyId, secretAccessKey }
+                  });
+
+                  async function uploadDir(dir, prefix = "") {
+                    const entries = fs.readdirSync(dir, { withFileTypes: true });
+                    for (const entry of entries) {
+                      const fullPath = path.join(dir, entry.name);
+                      const rel = path.join(prefix, entry.name).replace(/\\/g, "/");
+                      if (entry.isDirectory()) {
+                        await uploadDir(fullPath, rel);
+                      } else {
+                        const body = fs.readFileSync(fullPath);
+                        const key = `builds/${depId}/${rel}`;
+                        await s3.send(new PutObjectCommand({
+                          Bucket: bucketName,
+                          Key: key,
+                          Body: body,
+                          ContentType: rel.endsWith(".html") ? "text/html; charset=utf-8" :
+                                       rel.endsWith(".css") ? "text/css; charset=utf-8" :
+                                       rel.endsWith(".js") ? "application/javascript; charset=utf-8" : "application/octet-stream"
+                        }));
+                      }
+                    }
+                  }
+
+                  await uploadDir("built-files");
+                  console.log("R2 S3 upload complete");
+                  return;
+                } catch (s3Err) {
+                  console.log("S3 client upload unavailable, falling back to direct edge stream:", s3Err.message);
+                }
+              }
+
+              console.log("Using direct HTTPS edge stream upload to R2 via /api/builds/upload-file...");
+              await uploadDirViaEdge("built-files");
+              console.log("Edge R2 upload complete");
+            })().catch(err => {
               console.error("R2 upload error:", err);
               process.exit(1);
             });
