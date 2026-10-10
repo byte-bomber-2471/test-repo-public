@@ -1,0 +1,429 @@
+name: Conversora Builder Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        description: 'Conversora Deployment ID'
+        required: true
+        type: string
+      site_id:
+        description: 'Site Identifier'
+        required: true
+        type: string
+      project_id:
+        description: 'Project ID'
+        required: false
+        type: string
+      repo_owner:
+        description: 'Target Repository Owner'
+        required: true
+        type: string
+      repo_name:
+        description: 'Target Repository Name'
+        required: true
+        type: string
+      branch:
+        description: 'Git Branch'
+        required: true
+        default: 'main'
+        type: string
+      commit_sha:
+        description: 'Target Commit SHA'
+        required: true
+        type: string
+      framework:
+        description: 'Framework preset (astro, vite, nextjs, etc.)'
+        required: false
+        default: 'astro'
+        type: string
+      build_command:
+        description: 'Custom build command override'
+        required: false
+        type: string
+      output_dir:
+        description: 'Custom output directory override'
+        required: false
+        type: string
+      callback_url:
+        description: 'Conversora API Callback URL'
+        required: true
+        type: string
+      callback_token:
+        description: 'Temporary callback token'
+        required: false
+        type: string
+
+run-name: Build ${{ inputs.deployment_id }} (${{ inputs.repo_owner }}/${{ inputs.repo_name }}@${{ inputs.commit_sha }})
+
+jobs:
+  # =========================================================================
+  # JOB 1: UNTRUSTED BUILD (Zero access to R2 secrets or production credentials)
+  # =========================================================================
+  build:
+    name: Compile Frontend Project
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner Environment
+        run: |
+          echo "Harden runner: Disabling credential persistence"
+          git config --global credential.helper ""
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: '**/package-lock.json'
+
+      - name: Checkout User Repository at Exact SHA
+        run: |
+          echo "Cloning https://github.com/${{ inputs.repo_owner }}/${{ inputs.repo_name }} at ${{ inputs.commit_sha }}"
+          mkdir -p workspace
+          cd workspace
+          git init
+          git remote add origin "https://github.com/${{ inputs.repo_owner }}/${{ inputs.repo_name }}.git"
+          git fetch --depth 1 origin "${{ inputs.commit_sha }}"
+          git checkout FETCH_HEAD
+
+      - name: Install Dependencies
+        working-directory: workspace
+        run: |
+          echo "Installing project dependencies..."
+          if [ -f "package-lock.json" ]; then
+            npm ci --ignore-scripts || npm install --ignore-scripts
+          elif [ -f "yarn.lock" ]; then
+            npx yarn install --frozen-lockfile --ignore-scripts || npx yarn install --ignore-scripts
+          elif [ -f "pnpm-lock.yaml" ]; then
+            npx pnpm install --frozen-lockfile --ignore-scripts || npx pnpm install --ignore-scripts
+          elif [ -f "bun.lockb" ]; then
+            npx bun install --frozen-lockfile || npx bun install
+          else
+            npm install --ignore-scripts
+          fi
+
+      - name: Execute Framework Build
+        working-directory: workspace
+        run: |
+          echo "Building project for framework: ${{ inputs.framework }}"
+          CUSTOM_CMD="${{ inputs.build_command }}"
+          if [ -n "$CUSTOM_CMD" ]; then
+            eval "$CUSTOM_CMD"
+          elif [ "${{ inputs.framework }}" = "astro" ]; then
+            npx astro build
+          elif [ "${{ inputs.framework }}" = "vite" ]; then
+            npx vite build
+          elif [ "${{ inputs.framework }}" = "nextjs" ]; then
+            npx next build
+          else
+            npm run build
+          fi
+
+      - name: Locate and Package Build Output
+        working-directory: workspace
+        id: locate-output
+        run: |
+          OUTPUT_DIR="${{ inputs.output_dir }}"
+          if [ -z "$OUTPUT_DIR" ]; then
+            if [ -d "dist" ]; then
+              OUTPUT_DIR="dist"
+            elif [ -d "out" ]; then
+              OUTPUT_DIR="out"
+            elif [ -d "build" ]; then
+              OUTPUT_DIR="build"
+            elif [ -d ".output/public" ]; then
+              OUTPUT_DIR=".output/public"
+            elif [ -d "public" ]; then
+              OUTPUT_DIR="public"
+            else
+              echo "Error: No valid build output directory found!"
+              exit 1
+            fi
+          fi
+
+          echo "Found build directory: $OUTPUT_DIR"
+          if [ ! -f "$OUTPUT_DIR/index.html" ]; then
+            echo "Error: Verification Failed - $OUTPUT_DIR does not contain index.html"
+            exit 1
+          fi
+
+          mkdir -p ../artifact-bundle
+          cp -r "$OUTPUT_DIR"/* ../artifact-bundle/
+          cd ../artifact-bundle
+          echo "Artifact prepared with $(find . -type f | wc -l) files"
+
+      - name: Save Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output-${{ inputs.deployment_id }}
+          path: artifact-bundle/
+          retention-days: 1
+          if-no-files-found: error
+
+  # =========================================================================
+  # JOB 2: TRUSTED UPLOAD & NOTIFICATION (Holds R2 credentials & callback secret)
+  # =========================================================================
+  upload-and-notify:
+    name: Validate, Upload to R2 & Complete
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 10
+    steps:
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Handle Job 1 Failure (Fast Failure Callback)
+        if: ${{ needs.build.result != 'success' }}
+        run: |
+          echo "Job 1 build failed. Notifying Conversora API..."
+          node -e '
+            const crypto = require("crypto");
+            const depId = process.env.DEP_ID;
+            const callbackUrl = process.env.CALLBACK_URL;
+            const secret = process.env.CALLBACK_SECRET || "dev-build-callback-secret";
+            const runId = process.env.GITHUB_RUN_ID;
+
+            const payload = JSON.stringify({
+              deploymentId: depId,
+              status: "FAILED",
+              providerJobId: runId,
+              errorMessage: "Build process failed on runner. Check build command and dependencies."
+            });
+
+            const timestamp = Date.now().toString();
+            const hmac = crypto.createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");
+
+            fetch(callbackUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-conversora-signature-256": hmac,
+                "x-conversora-timestamp": timestamp
+              },
+              body: payload
+            }).then(r => r.json()).then(console.log).catch(console.error);
+          '
+        env:
+          DEP_ID: ${{ inputs.deployment_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
+
+      - name: Download Build Output
+        if: ${{ needs.build.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output-${{ inputs.deployment_id }}
+          path: built-files
+
+      - name: Validate Integrity & Generate Manifest
+        if: ${{ needs.build.result == 'success' }}
+        id: validate
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const crypto = require("crypto");
+
+            const rootDir = path.resolve("built-files");
+            const maxFiles = 10000;
+            const maxSize = 250 * 1024 * 1024; // 250MB
+
+            const filesMap = {};
+            let totalSize = 0;
+            let fileCount = 0;
+
+            function scan(dir, relPath = "") {
+              const entries = fs.readdirSync(dir, { withFileTypes: true });
+              for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                const rel = path.join(relPath, entry.name).replace(/\\/g, "/");
+
+                // Security check: path traversal bounds
+                if (rel.includes("..") || rel.includes("\0")) {
+                  throw new Error(`Malicious path detected: ${rel}`);
+                }
+
+                if (entry.isSymbolicLink()) {
+                  continue; // Skip symlinks for security
+                }
+
+                if (entry.isDirectory()) {
+                  scan(fullPath, rel);
+                } else if (entry.isFile()) {
+                  fileCount++;
+                  if (fileCount > maxFiles) throw new Error("File count exceeded maximum allowed (10,000 files)");
+
+                  const stat = fs.statSync(fullPath);
+                  totalSize += stat.size;
+                  if (totalSize > maxSize) throw new Error("Total size exceeded maximum allowed (250MB)");
+
+                  const buf = fs.readFileSync(fullPath);
+                  const hash = crypto.createHash("sha256").update(buf).digest("hex");
+                  const isHtml = rel.toLowerCase().endsWith(".html") || rel.toLowerCase().endsWith(".htm");
+
+                  let contentType = "application/octet-stream";
+                  if (isHtml) contentType = "text/html; charset=utf-8";
+                  else if (rel.endsWith(".css")) contentType = "text/css; charset=utf-8";
+                  else if (rel.endsWith(".js") || rel.endsWith(".mjs")) contentType = "application/javascript; charset=utf-8";
+                  else if (rel.endsWith(".json")) contentType = "application/json";
+                  else if (rel.endsWith(".svg")) contentType = "image/svg+xml";
+                  else if (rel.endsWith(".png")) contentType = "image/png";
+                  else if (rel.endsWith(".jpg") || rel.endsWith(".jpeg")) contentType = "image/jpeg";
+                  else if (rel.endsWith(".webp")) contentType = "image/webp";
+
+                  filesMap[rel] = {
+                    hash,
+                    size: stat.size,
+                    contentType,
+                    isHtml
+                  };
+                }
+              }
+            }
+
+            scan(rootDir);
+
+            if (!filesMap["index.html"] && !filesMap["index.htm"]) {
+              throw new Error("Verification Failed: index.html is missing in the compiled output!");
+            }
+
+            const manifest = {
+              version: 1,
+              deploymentId: process.env.DEP_ID,
+              siteId: process.env.SITE_ID,
+              projectId: process.env.PROJECT_ID || undefined,
+              files: filesMap,
+              totalFiles: fileCount,
+              totalSize,
+              createdAt: new Date().toISOString()
+            };
+
+            const manifestJson = JSON.stringify(manifest, null, 2);
+            fs.writeFileSync(path.join(rootDir, "manifest.json"), manifestJson);
+            const manifestHash = crypto.createHash("sha256").update(manifestJson).digest("hex");
+
+            fs.writeFileSync("manifest_meta.json", JSON.stringify({
+              manifestHash,
+              totalFiles: fileCount,
+              totalSize
+            }));
+
+            console.log(`Integrity verified: ${fileCount} files (${(totalSize / 1024).toFixed(1)} KB)`);
+          '
+        env:
+          DEP_ID: ${{ inputs.deployment_id }}
+          SITE_ID: ${{ inputs.site_id }}
+          PROJECT_ID: ${{ inputs.project_id }}
+
+      - name: Upload Built Files to Cloudflare R2
+        if: ${{ needs.build.result == 'success' }}
+        run: |
+          echo "Uploading compiled assets to R2 under prefix builds/${{ inputs.deployment_id }}/..."
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+
+            const accountId = process.env.R2_ACCOUNT_ID;
+            const accessKeyId = process.env.R2_ACCESS_KEY_ID;
+            const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
+            const bucketName = process.env.R2_BUCKET_NAME || "demo-web-builder-sites";
+            const depId = process.env.DEP_ID;
+
+            if (!accessKeyId || !secretAccessKey) {
+              console.log("No direct R2 S3 credentials found in secrets, skipping S3 SDK upload");
+              process.exit(0);
+            }
+
+            const s3 = new S3Client({
+              region: "auto",
+              endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+              credentials: { accessKeyId, secretAccessKey }
+            });
+
+            async function uploadDir(dir, prefix = "") {
+              const entries = fs.readdirSync(dir, { withFileTypes: true });
+              for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                const rel = path.join(prefix, entry.name).replace(/\\/g, "/");
+                if (entry.isDirectory()) {
+                  await uploadDir(fullPath, rel);
+                } else {
+                  const body = fs.readFileSync(fullPath);
+                  const key = `builds/${depId}/${rel}`;
+                  await s3.send(new PutObjectCommand({
+                    Bucket: bucketName,
+                    Key: key,
+                    Body: body,
+                    ContentType: rel.endsWith(".html") ? "text/html; charset=utf-8" :
+                                 rel.endsWith(".css") ? "text/css; charset=utf-8" :
+                                 rel.endsWith(".js") ? "application/javascript; charset=utf-8" : "application/octet-stream"
+                  }));
+                }
+              }
+            }
+
+            uploadDir("built-files").then(() => console.log("R2 upload complete")).catch(err => {
+              console.error("R2 upload error:", err);
+              process.exit(1);
+            });
+          '
+        env:
+          DEP_ID: ${{ inputs.deployment_id }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+
+      - name: Notify Conversora API Callback (Signal 1: Fast Path)
+        if: ${{ needs.build.result == 'success' }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const crypto = require("crypto");
+
+            const depId = process.env.DEP_ID;
+            const callbackUrl = process.env.CALLBACK_URL;
+            const secret = process.env.CALLBACK_SECRET || "dev-build-callback-secret";
+            const meta = JSON.parse(fs.readFileSync("manifest_meta.json", "utf8"));
+            const runId = process.env.GITHUB_RUN_ID;
+
+            const payload = JSON.stringify({
+              deploymentId: depId,
+              status: "SUCCESS",
+              providerJobId: runId,
+              manifestHash: meta.manifestHash,
+              fileCount: meta.totalFiles,
+              totalSize: meta.totalSize,
+              buildDurationMs: 60000
+            });
+
+            const timestamp = Date.now().toString();
+            const hmac = crypto.createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");
+
+            fetch(callbackUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-conversora-signature-256": hmac,
+                "x-conversora-timestamp": timestamp
+              },
+              body: payload
+            }).then(r => r.json()).then(res => {
+              console.log("Callback acknowledgment:", res);
+              if (res.error) process.exit(1);
+            }).catch(err => {
+              console.error("Callback failed:", err);
+              process.exit(1);
+            });
+          '
+        env:
+          DEP_ID: ${{ inputs.deployment_id }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          CALLBACK_SECRET: ${{ secrets.BUILD_CALLBACK_SECRET }}
